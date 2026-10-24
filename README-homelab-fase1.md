@@ -1,4 +1,4 @@
-# Homelab — Fase 1: Ubuntu Server con acceso remoto
+# Homelab — Fases 1 y 1b: Ubuntu Server con acceso remoto y servicios base
 
 > Laboratorio de sistemas montado en casa para practicar administración de servidores
 > Linux y Windows en un entorno propio, en paralelo al ciclo de ASIR.
@@ -62,6 +62,10 @@ abierto hacia internet.
 | Direccionamiento | 192.168.1.240/24 · gw 192.168.1.1 · DNS 192.168.1.1 y 1.1.1.1 |
 | Acceso local | OpenSSH, puerto 22 · autenticación por clave Ed25519 |
 | Acceso remoto | Tailscale (WireGuard) · 100.83.169.115 |
+| Cortafuegos | UFW · denegar entrante por defecto · apertura por servicio |
+| Servidor web | Nginx · puerto 80, accesible solo por el túnel |
+| Copias de seguridad | Script propio + cron diario, con rotación de 7 copias |
+| Zona horaria | Europe/Madrid |
 
 ---
 
@@ -243,6 +247,127 @@ PasswordAuthentication no
 PubkeyAuthentication yes
 ```
 
+### 7. Cortafuegos con UFW
+
+Configuración de un cortafuegos con política restrictiva. El orden de las operaciones no es
+indiferente: **las reglas se definen antes de activar el servicio**, porque activarlo primero
+con la política de denegar por defecto cortaría la propia sesión SSH en uso.
+
+```bash
+sudo ufw default deny incoming
+sudo ufw default allow outgoing
+sudo ufw allow from 192.168.1.0/24 to any port 22 proto tcp
+sudo ufw allow in on tailscale0 to any port 22 proto tcp
+sudo ufw show added        # revisión previa
+sudo ufw enable
+```
+
+**Decisión de diseño.** La primera versión de la regla del túnel era
+`ufw allow in on tailscale0`, que confía en la interfaz completa. Se sustituyó por una regla
+limitada al puerto 22. El criterio: la confianza se concede por servicio, no por interfaz.
+El coste es que cada servicio nuevo necesita su propia regla explícita; el beneficio es que
+nada queda expuesto por olvido.
+
+Estado resultante:
+
+| Destino | Acción | Origen |
+|---|---|---|
+| 22/tcp | ALLOW IN | 192.168.1.0/24 |
+| 22/tcp on tailscale0 | ALLOW IN | Anywhere |
+
+El sistema queda con **dos capas independientes**: el cortafuegos decide quién puede alcanzar
+el puerto, y la autenticación por clave decide quién puede entrar. Un atacante dentro de la
+red local seguiría necesitando una clave privada.
+
+### 8. Servidor web Nginx
+
+```bash
+sudo apt install -y nginx
+sudo ufw allow in on tailscale0 to any port 80 proto tcp
+```
+
+Nginx queda accesible **únicamente a través del túnel**, no desde la red local ni desde
+internet. Se sustituyó la página por defecto por una propia en `/var/www/html/index.html`,
+que tiene prioridad sobre `index.nginx-debian.html` según el orden definido en la directiva
+`index` del bloque `server`.
+
+Estructura de configuración, con el patrón habitual en Linux de *disponible* frente a
+*habilitado*:
+
+| Ruta | Contenido |
+|---|---|
+| `/etc/nginx/nginx.conf` | Configuración global |
+| `/etc/nginx/sites-available/` | Definición de cada sitio, activo o no |
+| `/etc/nginx/sites-enabled/` | Enlaces simbólicos a los sitios realmente servidos |
+| `/var/www/html/` | Archivos servidos |
+
+Para desactivar un sitio basta con eliminar su enlace simbólico, conservando la definición.
+
+```bash
+sudo nginx -t                  # validar antes de aplicar
+sudo systemctl reload nginx    # recargar sin cortar conexiones activas
+```
+
+El acceso se realiza por HTTP, sin certificado. El tráfico no viaja en claro porque lo cifra
+el túnel de Tailscale, pero el navegador no puede saberlo y lo marca como no seguro. Pendiente
+de evaluar la emisión de certificados mediante Tailscale.
+
+### 9. Copias de seguridad automáticas
+
+Script en `/usr/local/bin/backup-config.sh` que empaqueta las configuraciones modificadas,
+aplica rotación y deja registro en el sistema:
+
+```bash
+#!/bin/bash
+set -euo pipefail
+
+FECHA=$(date +%F_%H-%M)
+DESTINO="/var/backups/config"
+ARCHIVO="$DESTINO/config_$FECHA.tar.gz"
+
+mkdir -p "$DESTINO"
+
+tar -czf "$ARCHIVO" \
+    /etc/netplan \
+    /etc/ssh/sshd_config.d \
+    /etc/ufw \
+    /etc/nginx/sites-available \
+    /var/www/html \
+    2>/dev/null
+
+# Rotación: conservar solo las 7 copias más recientes
+ls -1t "$DESTINO"/config_*.tar.gz | tail -n +8 | xargs -r rm --
+
+logger -t backup-config "Copia creada: $ARCHIVO"
+```
+
+Cuatro decisiones del script:
+
+- **`set -euo pipefail`** aborta a la primera orden fallida, en lugar de continuar y generar
+  una copia incompleta que parecería válida.
+- **Rutas absolutas** en todo el script, porque cron se ejecuta con un entorno reducido y un
+  `PATH` distinto del de una sesión interactiva.
+- **Rotación** de 7 copias, para que el disco no crezca de forma indefinida.
+- **`logger`** escribe en el journal del sistema: una tarea automática que no deja rastro no
+  se puede auditar.
+
+Programación con cron:
+
+```
+30 3 * * * /usr/local/bin/backup-config.sh
+```
+
+**Verificación.** No basta con que el script funcione al ejecutarlo manualmente: hay que
+comprobar que cron lo lanza. Se programó temporalmente la tarea dos minutos por delante de la
+hora del sistema y se contrastaron dos registros distintos:
+
+```bash
+journalctl -u cron --since "5 min ago"        # ¿se lanzó la tarea?
+journalctl -t backup-config --since "5 min ago" # ¿hizo su trabajo?
+```
+
+Son dos preguntas independientes y se responden en logs independientes.
+
 ---
 
 ## Incidencias resueltas
@@ -409,6 +534,84 @@ existe es un riesgo; uno creado a propósito antes de tocar algo es una red de s
 
 ---
 
+### 7. Configuración aplicada pero sin efecto: precedencia de ficheros drop-in
+
+**Síntoma.** Tras crear `/etc/ssh/sshd_config.d/99-hardening.conf` con
+`PasswordAuthentication no` y reiniciar el servicio, el acceso por contraseña seguía
+funcionando. El log lo demostraba sin lugar a dudas:
+
+```
+16:46:30  Starting ssh.service ...
+16:48:02  Accepted password for martin from 100.111.120.125
+```
+
+Una autenticación por contraseña **posterior** al reinicio del servicio.
+
+**Causa.** OpenSSH procesa los ficheros de `sshd_config.d/` en orden alfabético y aplica
+**el primer valor que encuentra para cada directiva**, no el último. Un fichero generado por
+cloud-init con un número de orden inferior fijaba `PasswordAuthentication yes`, de modo que el
+fichero `99-` nunca llegaba a tener efecto.
+
+**Solución.** Renombrar el fichero para que se procese antes, y verificar la configuración
+efectiva en lugar de asumirla:
+
+```bash
+sudo mv /etc/ssh/sshd_config.d/99-hardening.conf /etc/ssh/sshd_config.d/01-hardening.conf
+sudo sshd -t
+sudo systemctl restart ssh
+sudo sshd -T | grep -i passwordauthentication
+```
+
+`sshd -T` muestra la configuración que el servicio aplica realmente, resolviendo todos los
+ficheros incluidos. Es la única fuente fiable.
+
+**Problema asociado.** La prueba inicial desde el cliente móvil parecía correcta porque la
+conexión no solicitaba contraseña. En realidad el cliente la tenía almacenada y la enviaba de
+forma automática: no estaba utilizando la clave. El log del servidor fue lo que reveló la
+diferencia entre `Accepted password` y `Accepted publickey`.
+
+**Aprendizaje.** Dos cosas. Que el orden de los ficheros de configuración fragmentada importa,
+y que no siempre es el último el que gana. Y que una prueba funcional puede dar un falso
+positivo: la verificación válida no era "¿me deja entrar?" sino "¿con qué método me ha dejado
+entrar?". Esa distinción solo la daba el registro del servidor.
+
+---
+
+### 8. Zona horaria del sistema frente a la hora local
+
+**Síntoma.** Al programar una tarea de prueba para dos minutos más tarde según el reloj
+propio, la tarea no se ejecutaba a la hora esperada.
+
+**Causa.** El sistema estaba configurado en UTC, mientras que la hora de referencia utilizada
+al redactar la expresión de cron era la local (CEST, UTC+2). Cron emplea siempre la hora del
+sistema, de modo que existía un desfase de dos horas entre lo programado y lo esperado.
+
+**Solución.** Verificar la hora real del sistema antes de programar cualquier tarea:
+
+```bash
+date
+timedatectl
+```
+
+Y, en este caso, alinear el sistema con la zona horaria local:
+
+```bash
+sudo timedatectl set-timezone Europe/Madrid
+```
+
+**Consideración.** Mantener los servidores en UTC es la práctica habitual en entornos
+profesionales por dos motivos: los registros de distintos sistemas resultan directamente
+comparables, y se evita el problema del cambio de hora, en el que una tarea programada entre
+las 2:00 y las 3:00 se ejecuta dos veces en octubre y ninguna en marzo. Se optó por la hora
+local por comodidad en un entorno de laboratorio, situando la tarea a las 3:30 para dejarla
+fuera de la franja conflictiva.
+
+**Aprendizaje.** Una parte no pequeña de las incidencias del tipo «la tarea programada no se
+ejecutó» no son fallos del programador de tareas, sino diferencias entre la hora del sistema y
+la del operador.
+
+---
+
 ## Comandos de referencia
 
 ```bash
@@ -438,6 +641,26 @@ sudo apt update && sudo apt upgrade -y
 sudo tailscale up
 tailscale ip -4
 tailscale status
+
+# SSH: configuración efectiva y registro de accesos
+sudo sshd -t                      # validar sintaxis
+sudo sshd -T | grep -i password   # configuración realmente aplicada
+sudo journalctl -u ssh | grep Accepted
+
+# Cortafuegos
+sudo ufw status verbose
+sudo ufw show added
+sudo ufw allow in on tailscale0 to any port <puerto> proto tcp
+
+# Nginx
+sudo nginx -t
+sudo systemctl reload nginx
+
+# Tareas programadas
+date && timedatectl
+sudo crontab -l
+journalctl -u cron --since "10 min ago"
+journalctl -t backup-config --since yesterday
 ```
 
 ```powershell
@@ -468,18 +691,24 @@ ssh-add $env:USERPROFILE\.ssh\id_ed25519
 | Administración remota | ISO · U9 |
 | Sistema de ficheros, usuarios y procesos en Linux | ISO · U10 |
 | Seguridad de cuentas y autenticación | ISO · U2 |
+| Copias de seguridad y aseguramiento de la información | ISO · U3 |
+| Supervisión del sistema mediante registros | ISO · U7 |
 
 ---
 
 ## Siguientes fases
 
-**Fase 1b — Consolidación del servidor Linux** *(en curso)*
+**Fase 1b — Consolidación del servidor Linux** *(completada)*
 - [x] Autenticación por clave SSH desde el cliente Windows
-- [ ] Clave SSH en el cliente móvil
-- [ ] Deshabilitar la autenticación por contraseña
-- [ ] Cortafuegos con UFW
-- [ ] Servidor web Nginx
-- [ ] Tareas programadas con cron y copias de seguridad
+- [x] Clave SSH en el cliente móvil
+- [x] Deshabilitar la autenticación por contraseña
+- [x] Cortafuegos UFW con política restrictiva
+- [x] Servidor web Nginx accesible solo por el túnel
+- [x] Copias de seguridad automáticas con cron, rotación y registro
+
+**Pendiente de evaluar**
+- [ ] HTTPS mediante certificados emitidos por Tailscale
+- [ ] Monitorización de servicios
 
 **Fase 2 — Windows Server**
 Controlador de dominio con Active Directory, DNS, DHCP, unidades organizativas, directivas
