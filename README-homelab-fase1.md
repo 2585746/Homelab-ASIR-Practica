@@ -60,7 +60,7 @@ abierto hacia internet.
 | Sistema invitado | Ubuntu Server 26.04.1 LTS |
 | Red virtual | Conmutador externo en puente sobre la NIC Realtek PCIe GbE |
 | Direccionamiento | 192.168.1.240/24 · gw 192.168.1.1 · DNS 192.168.1.1 y 1.1.1.1 |
-| Acceso local | OpenSSH, puerto 22 |
+| Acceso local | OpenSSH, puerto 22 · autenticación por clave Ed25519 |
 | Acceso remoto | Tailscale (WireGuard) · 100.83.169.115 |
 
 ---
@@ -192,6 +192,56 @@ desconectado sin aviso.
 Validación final: conexión por SSH desde un Pixel 10a con Termius, **con el WiFi desactivado
 y saliendo por datos móviles**, para confirmar que el acceso funcionaba realmente a través
 del túnel y no por estar en la misma red local.
+
+### 6. Autenticación por clave SSH
+
+Sustitución de la autenticación por contraseña por un par de claves asimétricas Ed25519.
+Generación en el cliente Windows:
+
+```powershell
+ssh-keygen -t ed25519 -C "martin-homelab"
+```
+
+El proceso produce dos ficheros en `%USERPROFILE%\.ssh\`:
+
+| Fichero | Función |
+|---|---|
+| `id_ed25519` | Clave **privada**, protegida con passphrase. No abandona el cliente |
+| `id_ed25519.pub` | Clave **pública**. Es la que se instala en los servidores |
+
+Instalación de la clave pública en el servidor, creando el directorio con los permisos que
+exige OpenSSH:
+
+```powershell
+type $env:USERPROFILE\.ssh\id_ed25519.pub | ssh martin@192.168.1.240 `
+  "mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
+```
+
+Los permisos no son opcionales: OpenSSH rechaza las claves si el directorio `~/.ssh` o el
+fichero `authorized_keys` son accesibles por otros usuarios.
+
+Para evitar introducir la passphrase en cada conexión se habilitó el agente SSH de Windows,
+que mantiene la clave descifrada en memoria mientras dura la sesión:
+
+```powershell
+Get-Service ssh-agent | Set-Service -StartupType Automatic
+Start-Service ssh-agent
+ssh-add $env:USERPROFILE\.ssh\id_ed25519
+```
+
+**Decisión deliberada: no se deshabilitó aún la autenticación por contraseña.** El acceso
+desde el móvil sigue utilizándola, de modo que cerrarla ahora dejaría ese cliente fuera. El
+criterio aplicado es no retirar un método de acceso hasta haber verificado el nuevo **desde
+todos los clientes** que vayan a usarlo. Es el punto exacto en el que es habitual perder el
+acceso al propio servidor.
+
+Pendiente para la siguiente sesión: generar un par de claves en el cliente móvil, instalar su
+clave pública y entonces sí aplicar el endurecimiento del servicio:
+
+```
+PasswordAuthentication no
+PubkeyAuthentication yes
+```
 
 ---
 
@@ -395,6 +445,12 @@ tailscale status
 Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V -All
 bcdedit /enum {current} | findstr -i hypervisor
 ssh martin@192.168.1.240
+
+# Claves SSH
+ssh-keygen -t ed25519 -C "martin-homelab"
+Get-Service ssh-agent | Set-Service -StartupType Automatic
+Start-Service ssh-agent
+ssh-add $env:USERPROFILE\.ssh\id_ed25519
 ```
 
 ---
@@ -411,14 +467,19 @@ ssh martin@192.168.1.240
 | Resolución de nombres | ISO · U2 |
 | Administración remota | ISO · U9 |
 | Sistema de ficheros, usuarios y procesos en Linux | ISO · U10 |
+| Seguridad de cuentas y autenticación | ISO · U2 |
 
 ---
 
 ## Siguientes fases
 
-**Fase 1b — Consolidación del servidor Linux**
-Autenticación por clave SSH en lugar de contraseña, cortafuegos con UFW, servidor web Nginx,
-tareas programadas con cron y copias de seguridad.
+**Fase 1b — Consolidación del servidor Linux** *(en curso)*
+- [x] Autenticación por clave SSH desde el cliente Windows
+- [ ] Clave SSH en el cliente móvil
+- [ ] Deshabilitar la autenticación por contraseña
+- [ ] Cortafuegos con UFW
+- [ ] Servidor web Nginx
+- [ ] Tareas programadas con cron y copias de seguridad
 
 **Fase 2 — Windows Server**
 Controlador de dominio con Active Directory, DNS, DHCP, unidades organizativas, directivas
@@ -427,3 +488,4 @@ de grupo y un cliente Windows unido al dominio.
 **Fase 3 — Integración**
 Unión del servidor Ubuntu al dominio de Active Directory, de forma que autentique contra los
 mismos usuarios que los equipos Windows.
+
